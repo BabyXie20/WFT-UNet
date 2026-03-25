@@ -1,17 +1,17 @@
 import csv
-import json
 from collections import OrderedDict
 
 import torch
 from fvcore.nn import FlopCountAnalysis
+from monai.networks.nets import SwinUNETR, UNETR
 
-# =========================
-# 改这里：导入你自己的模型
-# 例如：
-# from models.unet import UNet3D
-# from networks.my_model import MyModel
-# =========================
-from xx import xx
+from networks.Att_UNet import AttU_Net3D
+from networks.TraBTS import BTS
+from networks.UNet3D import UNet3D
+from networks.UNetr_plusplus import UNETR_PP
+from networks.UXNet import UXNET
+from networks.VSNet import VSNet
+from networks.model import VNet
 
 
 def load_checkpoint(model, ckpt_path):
@@ -38,10 +38,9 @@ def load_checkpoint(model, ckpt_path):
     print(f"[Checkpoint] Unexpected keys: {len(incompatible.unexpected_keys)}")
 
 
-def count_params_m(model):
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return total / 1e6, trainable / 1e6
+def count_gparams(model):
+    total_params = sum(p.numel() for p in model.parameters())
+    return total_params / 1e9
 
 
 def count_gflops(model, x):
@@ -49,106 +48,101 @@ def count_gflops(model, x):
     flops.unsupported_ops_warnings(False)
     flops.uncalled_modules_warnings(False)
     total_flops = flops.total()
-    unsupported = flops.unsupported_ops()
-    return total_flops / 1e9, unsupported
+    return total_flops / 1e9
 
 
-def save_csv(csv_path, row):
-    fieldnames = [
-        "model_name",
-        "input_shape",
-        "ckpt",
-        "device",
-        "total_params_m",
-        "trainable_params_m",
-        "gflops",
-        "unsupported_ops_json",
-    ]
+def format_4_sig(value):
+    return f"{value:.4g}"
+
+
+def save_csv(csv_path, rows):
+    fieldnames = ["model", "GParams", "GFlops"]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerow(row)
+        writer.writerows(rows)
+
+
+def build_models():
+    return [
+        lambda: UNETR(
+            in_channels=1,
+            out_channels=14,
+            img_size=(96, 96, 96),
+            feature_size=16,
+            hidden_size=768,
+            mlp_dim=3072,
+            num_heads=12,
+            proj_type="conv",
+            norm_name="instance",
+            res_block=True,
+            dropout_rate=0.0,
+            spatial_dims=3,
+        ),
+        lambda: SwinUNETR(
+            img_size=(96, 96, 96),
+            in_channels=1,
+            out_channels=14,
+            feature_size=24,
+            spatial_dims=3,
+        ),
+        lambda: BTS(
+            img_dim=96,
+            patch_dim=8,
+            num_channels=1,
+            num_classes=14,
+            embedding_dim=512,
+            num_heads=8,
+            num_layers=4,
+            hidden_dim=4096,
+            dropout_rate=0.1,
+            attn_dropout_rate=0.1,
+            positional_encoding_type="learned",
+            apply_softmax=False,
+        ),
+        lambda: UNet3D(in_channels=1, out_channels=14, f_maps=24),
+        lambda: AttU_Net3D(input_channel=1, num_classes=14),
+        lambda: VSNet(in_channels=1, out_channels=14, img_size=96),
+        lambda: VNet(n_channels=1, n_classes=14),
+        lambda: UNETR_PP(in_channels=1, out_channels=14, img_size=(96, 96, 96)),
+        lambda: UXNET(in_chans=1, out_chans=14),
+    ]
 
 
 def main():
-    # =========================
-    # 1. 设备
-    # =========================
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # =========================
-    # 2. 你自己手动写参数
-    # =========================
-    ckpt_path = None
-    # ckpt_path = "your_checkpoint.pth"
-
     output_csv = "model_stats.csv"
 
-    batch_size = 1
-    n_channels = 1
-    roi_size = (96, 96, 96)
+    x = torch.randn(1, 1, 96, 96, 96).to(device)
+    rows = []
 
-    # =========================
-    # 3. 你自己手动实例化模型
-    #    改成 model = xx(...).to(device)
-    # =========================
-    model = xx(
-        # 这里写你模型需要的参数
-        # 例如：
-        # in_channels=n_channels,
-        # out_channels=14,
-        # feature_size=48,
-    ).to(device)
+    for create_model in build_models():
+        model = create_model().to(device)
+        model.eval()
+        model_name = model.__class__.__name__
 
-    # 如果有 checkpoint 就加载
-    if ckpt_path is not None:
-        load_checkpoint(model, ckpt_path)
+        gparams = count_gparams(model)
 
-    model.eval()
+        try:
+            with torch.no_grad():
+                gflops = count_gflops(model, x)
+            gflops_str = format_4_sig(gflops)
+        except Exception as err:
+            print(f"[FLOPs] {model_name} 计算失败: {err}")
+            gflops_str = "N/A"
 
-    # =========================
-    # 4. 构造输入
-    #    如果你的模型输入尺寸不是这个形式，也在这里改
-    # =========================
-    x = torch.randn(batch_size, n_channels, *roi_size).to(device)
+        rows.append(
+            {
+                "model": model_name,
+                "GParams": format_4_sig(gparams),
+                "GFlops": gflops_str,
+            }
+        )
 
-    total_params_m, trainable_params_m = count_params_m(model)
+        print(f"{model_name:12s} | GParams={format_4_sig(gparams)} | GFlops={gflops_str}")
 
-    try:
-        with torch.no_grad():
-            gflops, unsupported = count_gflops(model, x)
-    except Exception as e:
-        gflops, unsupported = None, {"flop_count_error": str(e)}
-        print(f"[FLOPs] Failed to compute FLOPs: {e}")
-
-    print("=" * 50)
-    print(f"Model            : {model.__class__.__name__}")
-    print(f"Input shape      : {tuple(x.shape)}")
-    print(f"Total Params     : {total_params_m:.2f} M")
-    print(f"Trainable Params : {trainable_params_m:.2f} M")
-    if gflops is not None:
-        print(f"GFLOPs           : {gflops:.2f} G")
-    else:
-        print("GFLOPs           : unavailable")
-    print(f"CSV Saved        : {output_csv}")
-    print("=" * 50)
-
-    if unsupported:
-        print("[Warning] Unsupported ops not counted by fvcore:")
-        for k, v in unsupported.items():
-            print(f"  {k}: {v}")
-
-    row = {
-        "model_name": model.__class__.__name__,
-        "input_shape": str(tuple(x.shape)),
-        "ckpt": "" if ckpt_path is None else ckpt_path,
-        "device": str(device),
-        "total_params_m": f"{total_params_m:.6f}",
-        "trainable_params_m": f"{trainable_params_m:.6f}",
-        "gflops": "" if gflops is None else f"{gflops:.6f}",
-        "unsupported_ops_json": json.dumps(unsupported, ensure_ascii=False),
-    }
-    save_csv(output_csv, row)
+    save_csv(output_csv, rows)
+    print(f"结果已保存到: {output_csv}")
 
 
 if __name__ == "__main__":
