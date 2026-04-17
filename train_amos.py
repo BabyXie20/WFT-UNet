@@ -1,0 +1,1858 @@
+import os
+import re
+import json
+import csv
+import time
+import math
+import argparse
+import tempfile
+import random
+import shutil
+import sys
+import platform
+import hashlib
+import inspect
+import subprocess
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
+
+import torch
+from torch.utils.tensorboard import SummaryWriter
+from torch.amp import autocast, GradScaler
+from tqdm import tqdm
+
+from monai.config import print_config
+from monai.utils import set_determinism
+from monai.data import (
+    DataLoader,
+    CacheDataset,
+    load_decathlon_datalist,
+    decollate_batch,
+    list_data_collate,
+)
+from monai.inferers import sliding_window_inference
+from monai.losses import DiceCELoss
+from monai.metrics import DiceMetric, HausdorffDistanceMetric
+from monai.transforms import (
+    AsDiscrete,
+    Compose,
+    CropForegroundd,
+    EnsureChannelFirstd,
+    LoadImaged,
+    Orientationd,
+    RandCropByPosNegLabeld,
+    ScaleIntensityRanged,
+    Spacingd,
+    RandGaussianNoised,
+    RandAffined,
+    RandShiftIntensityd,
+)
+import numpy as np
+from networks.model import WFT_UNet
+
+
+CLASS_LABELS = {
+    "0": "background",
+    "1": "spleen",
+    "2": "rkid",
+    "3": "lkid",
+    "4": "gall",
+    "5": "eso",
+    "6": "liver",
+    "7": "sto",
+    "8": "aorta",
+    "9": "IVC",
+    "10": "pancreas",
+    "11": "rad",
+    "12": "lad",
+    "13": "duodenum",
+    "14": "bladder",
+    "15": "prostate_or_uterus",
+}
+
+rot = np.deg2rad(30.0)
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        "MONAI AMOS - Iteration Training + TensorBoard + custom split; "
+    )
+
+           
+    parser.add_argument("--data_dir", type=str, default="../data1/amos")
+    parser.add_argument("--split_json", type=str, default="dataset_0.json")
+
+    parser.add_argument("--output_root", type=str, default="./outputs_amos")
+    parser.add_argument("--run_name", type=str, default="", help="optional, if empty use timestamp")
+
+                   
+    parser.add_argument("--pixdim", type=float, nargs=3, default=[1.5, 1.5, 2.0])
+    parser.add_argument("--roi_size", type=int, nargs=3, default=[96, 96, 96])
+    parser.add_argument("--num_classes", type=int, default=16)
+
+                   
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_samples", type=int, default=2, help="RandCropByPosNegLabeld num_samples")
+    parser.add_argument("--cache_num_train", type=int, default=160, help="<=0 means cache all")
+    parser.add_argument("--cache_num_val", type=int, default=20, help="<=0 means cache all")
+    parser.add_argument("--cache_num_test", type=int, default=20, help="<=0 means cache all")
+    parser.add_argument("--cache_rate", type=float, default=1.0)
+
+    parser.add_argument("--num_workers_train", type=int, default=8)
+    parser.add_argument("--num_workers_val", type=int, default=6)
+    parser.add_argument("--num_workers_test", type=int, default=6)
+
+                                          
+    parser.add_argument("--max_iterations", type=int, default=60000)
+    parser.add_argument("--eval_num", type=int, default=400)
+    parser.add_argument("--val_start_iter", type=int, default=12000, help="start val eval at this iter (inclusive)")
+    parser.add_argument("--sw_batch_size", type=int, default=2)
+    parser.add_argument("--sw_overlap", type=float, default=0.5)
+    parser.add_argument(
+        "--save_ckpt_every",
+        type=int,
+        default=4000,
+        help="save periodic checkpoint every N iterations; <=0 disables it",
+    )
+    parser.add_argument(
+    "--resume",
+    type=str,
+    default="",
+    help="path to a full training checkpoint for resuming",
+    )
+           
+    parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--wd", type=float, default=1e-4)
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="sgd",
+        choices=["sgd", "adamw"],
+        help="optimizer type: sgd or adamw",
+    )
+    parser.add_argument(
+        "--adamw_betas",
+        type=float,
+        nargs=2,
+        default=[0.9, 0.999],
+        metavar=("BETA1", "BETA2"),
+        help="betas for AdamW, only used when --optimizer adamw",
+    )
+    parser.add_argument(
+        "--adamw_eps",
+        type=float,
+        default=1e-8,
+        help="eps for AdamW, only used when --optimizer adamw",
+    )
+
+                            
+    parser.add_argument("--use_poly", action="store_true", help="use PolyLR per-iteration")
+    parser.add_argument("--poly_power", type=float, default=0.9)
+    parser.add_argument("--min_lr", type=float, default=1e-6)
+
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=8,
+        help="stop after N validations without improvement (monitor: val foreground Dice)",
+    )
+    parser.add_argument(
+        "--early_stop_min_delta",
+        type=float,
+        default=1e-3,
+        help="minimum absolute improvement to reset patience",
+    )
+    parser.add_argument(
+        "--early_stop_warmup",
+        type=int,
+        default=0,
+        help="ignore early-stop counting for first N validations",
+    )
+    parser.add_argument(
+        "--pool_keys",
+        type=str,
+        nargs="+",
+        default=["training"],
+        help="take labeled cases from these json keys and merge as pool (must contain image+label pairs)",
+    )
+    parser.add_argument("--train_num", type=int, default=160, help="number of train cases (default 160)")
+    parser.add_argument(
+        "--val_num",
+        type=int,
+        default=20,
+        help="number of validation cases (ONLY used when --val_separate is set). Default 20.",
+    )
+    parser.add_argument("--test_num", type=int, default=20, help="number of test cases (default 20)")
+    parser.add_argument(
+        "--val_separate",
+        action="store_true",
+        help="if set, split into independent val and test sets using val_num/test_num. "
+        "If not set (default), val set will be identical to test set.",
+    )
+    parser.add_argument(
+        "--disable_json_split",
+        action="store_true",
+        help="disable predefined training/validation/test split from json and use random split arguments instead.",
+    )
+    parser.add_argument("--split_seed", type=int, default=123, help="seed for deterministic split shuffling")
+    parser.add_argument(
+        "--exclude_cases",
+        type=str,
+        nargs="*",
+        default=[],
+        help="exclude these case ids before splitting (e.g. 0008). default: [] (no exclusion)",
+    )
+    parser.add_argument(
+        "--snapshot_extra",
+        type=str,
+        nargs="*",
+        default=["networks"],
+        help="extra relative paths (dirs/files) to snapshot into outputs (e.g. networks configs).",
+    )
+
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--amp", action="store_true", help="use mixed precision")
+    parser.add_argument("--cudnn_benchmark", action="store_true", help="torch.backends.cudnn.benchmark=True")
+
+    return parser.parse_args()
+
+
+def seed_everything(seed: int) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    set_determinism(seed=seed)
+
+
+def seed_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def safe_float(x: float) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+        return None
+    return float(x)
+
+
+def tensor_to_float_list(t: torch.Tensor) -> List[Optional[float]]:
+    t = t.detach().float().cpu()
+    out: List[Optional[float]] = []
+    for v in t.tolist():
+        out.append(safe_float(v))
+    return out
+
+
+def get_class_names(num_classes: int) -> List[str]:
+    names = []
+    for i in range(num_classes):
+        key = str(i)
+        names.append(CLASS_LABELS.get(key, f"class_{i}"))
+    return names
+
+
+def _safe_run_cmd(cmd: List[str], cwd: Optional[str] = None, timeout: int = 5) -> Tuple[int, str, str]:
+    try:
+        p = subprocess.run(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+            text=True,
+        )
+        return int(p.returncode), p.stdout.strip(), p.stderr.strip()
+    except Exception as e:
+        return 999, "", f"{type(e).__name__}: {e}"
+
+
+def _sha256_file(path: str, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk_size)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _ignore_snapshot_files(dirpath: str, names: List[str]) -> set:
+    ignore = {
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".git",
+        ".idea",
+        ".vscode",
+        "wandb",
+        ".DS_Store",
+    }
+    out = set()
+    for n in names:
+        if n in ignore:
+            out.add(n)
+        elif n.endswith((".pyc", ".pyo", ".so")):
+            out.add(n)
+    return out
+
+
+def save_code_snapshot(output_dir: str, extra_rel_paths: Optional[List[str]] = None) -> None:
+    snapshot_dir = os.path.join(output_dir, "snapshot")
+    os.makedirs(snapshot_dir, exist_ok=True)
+
+    script_path = None
+    try:
+        script_path = os.path.abspath(__file__)
+    except Exception:
+        script_path = None
+
+    base_dir = None
+    if script_path and os.path.isfile(script_path):
+        base_dir = os.path.dirname(script_path)
+    else:
+        base_dir = os.getcwd()
+
+    copied: List[Dict[str, Any]] = []
+
+                         
+    if script_path and os.path.isfile(script_path):
+        dst = os.path.join(snapshot_dir, os.path.basename(script_path))
+        shutil.copy2(script_path, dst)
+        copied.append({"type": "file", "src": script_path, "dst": dst, "sha256": _sha256_file(dst)})
+    else:
+        try:
+            src_text = inspect.getsource(sys.modules[__name__])
+            dst = os.path.join(snapshot_dir, "train_script_snapshot.py")
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write(src_text)
+            copied.append(
+                {"type": "file_generated", "src": "<inspect.getsource>", "dst": dst, "sha256": _sha256_file(dst)}
+            )
+        except Exception as e:
+            print(f"[SNAPSHOT][WARN] cannot save script source: {type(e).__name__}: {e}")
+
+                         
+    extra_rel_paths = extra_rel_paths or []
+    for rel in extra_rel_paths:
+        if not rel:
+            continue
+        src = rel
+        if not os.path.isabs(src):
+            src = os.path.join(base_dir, rel)
+        if not os.path.exists(src):
+            print(f"[SNAPSHOT][WARN] extra path not found: {src}")
+            continue
+
+        dst = os.path.join(snapshot_dir, os.path.basename(src))
+        try:
+            if os.path.isdir(src):
+                if os.path.exists(dst):
+                    shutil.rmtree(dst, ignore_errors=True)
+                shutil.copytree(src, dst, ignore=_ignore_snapshot_files)
+                copied.append({"type": "dir", "src": src, "dst": dst})
+            else:
+                shutil.copy2(src, dst)
+                copied.append({"type": "file", "src": src, "dst": dst, "sha256": _sha256_file(dst)})
+        except Exception as e:
+            print(f"[SNAPSHOT][WARN] failed copying {src} -> {dst}: {type(e).__name__}: {e}")
+
+                            
+    git_commit = ""
+    git_dirty = None
+    git_root = None
+    if base_dir:
+        rc, out, _ = _safe_run_cmd(["git", "rev-parse", "--show-toplevel"], cwd=base_dir)
+        if rc == 0 and out:
+            git_root = out
+            rc2, out2, _ = _safe_run_cmd(["git", "rev-parse", "HEAD"], cwd=git_root)
+            if rc2 == 0:
+                git_commit = out2.strip()
+            rc3, out3, _ = _safe_run_cmd(["git", "status", "--porcelain"], cwd=git_root)
+            if rc3 == 0:
+                git_dirty = (len(out3.strip()) > 0)
+
+    meta = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "output_dir": os.path.abspath(output_dir),
+        "snapshot_dir": os.path.abspath(snapshot_dir),
+        "script_path": os.path.abspath(script_path) if script_path else "",
+        "base_dir": os.path.abspath(base_dir) if base_dir else "",
+        "cmdline": sys.argv,
+        "python": {"version": sys.version.replace("\n", " "), "executable": sys.executable},
+        "platform": {"system": platform.system(), "release": platform.release(), "machine": platform.machine()},
+        "packages": {
+            "torch": getattr(torch, "__version__", ""),
+            "cuda_available": bool(torch.cuda.is_available()),
+            "cuda_version": getattr(torch.version, "cuda", ""),
+            "cudnn_version": torch.backends.cudnn.version() if hasattr(torch.backends, "cudnn") else None,
+            "monai": "",
+        },
+        "git": {"root": git_root or "", "commit": git_commit, "dirty": git_dirty},
+        "copied": copied,
+    }
+
+    try:
+        import monai              
+        meta["packages"]["monai"] = getattr(monai, "__version__", "")
+    except Exception:
+        meta["packages"]["monai"] = ""
+
+    snapshot_meta_txt = os.path.join(snapshot_dir, "snapshot_meta.txt")
+    with open(snapshot_meta_txt, "w", encoding="utf-8") as f:
+        f.write(json.dumps(meta, indent=2, ensure_ascii=False))
+
+    print(f"[SNAPSHOT] saved to: {snapshot_dir}")
+    print(f"[SNAPSHOT] items: {len(copied)} (meta written: snapshot_meta.txt)")
+
+
+                              
+                                          
+                              
+def _normalize_case_id(cid: str) -> str:
+    cid = str(cid).strip()
+    if cid.isdigit():
+        return cid.zfill(4)
+    return cid
+
+
+def _extract_case_ids_from_basename(base: str) -> List[str]:
+    ids: List[str] = []
+    ids4 = re.findall(r"(?<!\d)(\d{4})(?!\d)", base)
+    if ids4:
+        return [x for x in ids4]
+    for g in re.findall(r"\d+", base):
+        if len(g) <= 4:
+            ids.append(g.zfill(4))
+    return ids
+
+
+def _match_excluded_case(d: Dict[str, Any], excluded_set: set) -> bool:
+    for k in ("image", "label"):
+        p = str(d.get(k, "") or "")
+        base = os.path.basename(p)
+        cand = _extract_case_ids_from_basename(base)
+        if any(c in excluded_set for c in cand):
+            return True
+    return False
+
+def _replace_dir_token(path_str: str, old_token: str, new_token: str) -> str:
+    if not path_str:
+        return path_str
+                              
+    pattern = rf'([/\\\\]){re.escape(old_token)}([/\\\\])'
+    return re.sub(pattern, rf"\1{new_token}\2", path_str, count=1)
+
+
+def _fix_single_pair_paths(d: Dict[str, Any], split_name: str = "test") -> Dict[str, Any]:
+    """
+    如果 json 里的 eval/test 路径写成 imagesTs/labelsTs，但本地真实文件在 imagesTr/labelsTr，
+    则自动回退到 Tr 路径。
+    """
+    out = dict(d)
+
+    img = str(out.get("image", "") or "")
+    lab = str(out.get("label", "") or "")
+
+                                 
+    if img and (not os.path.exists(img)):
+        cand = _replace_dir_token(img, "imagesTs", "imagesTr")
+        if cand != img and os.path.exists(cand):
+            print(f"[PATH_FIX][{split_name}] image: {img}  -->  {cand}")
+            img = cand
+
+                                 
+    if lab and (not os.path.exists(lab)):
+        cand = _replace_dir_token(lab, "labelsTs", "labelsTr")
+        if cand != lab and os.path.exists(cand):
+            print(f"[PATH_FIX][{split_name}] label: {lab}  -->  {cand}")
+            lab = cand
+
+    out["image"] = img
+    out["label"] = lab
+    return out
+
+
+def _fix_split_pair_paths(files: List[Dict[str, Any]], split_name: str) -> List[Dict[str, Any]]:
+    """
+    对一个 split 的全部样本做路径修正，并在修正后做存在性检查。
+    """
+    fixed: List[Dict[str, Any]] = []
+    changed = 0
+
+    for d in files:
+        nd = _fix_single_pair_paths(d, split_name=split_name)
+        if (nd.get("image") != d.get("image")) or (nd.get("label") != d.get("label")):
+            changed += 1
+        fixed.append(nd)
+
+    if changed > 0:
+        print(f"[PATH_FIX][{split_name}] changed {changed}/{len(files)} entries")
+
+                                            
+    missing: List[Tuple[int, str, str]] = []
+    for i, d in enumerate(fixed):
+        for k in ("image", "label"):
+            p = str(d.get(k, "") or "")
+            if (not p) or (not os.path.exists(p)):
+                missing.append((i, k, p))
+                if len(missing) >= 5:
+                    break
+        if len(missing) >= 5:
+            break
+
+    if missing:
+        msg = "\n".join([f"  [{i}] {k}: {p}" for i, k, p in missing])
+        raise FileNotFoundError(
+            f"[PATH_FIX][{split_name}] some files still do not exist after fallback:\n{msg}"
+        )
+
+    return fixed
+
+
+def build_custom_splits_from_json(
+    json_path: str,
+    pool_keys: List[str],
+    train_num: int,
+    val_num: int,
+    test_num: int,
+    split_seed: int,
+    exclude_cases: Optional[List[str]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    pool: List[Dict[str, Any]] = []
+    for k in pool_keys:
+        part = load_decathlon_datalist(json_path, True, k)
+        pool.extend(part)
+
+            
+    uniq: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for d in pool:
+        key = (d.get("image", ""), d.get("label", ""))
+        if not key[0] or not key[1]:
+            continue
+        uniq[key] = d
+    pool = list(uniq.values())
+
+                                              
+    excluded_set = set()
+    if exclude_cases:
+        excluded_set = {_normalize_case_id(x) for x in exclude_cases}
+
+    if excluded_set:
+        before = len(pool)
+        pool = [d for d in pool if not _match_excluded_case(d, excluded_set)]
+        after = len(pool)
+        print(f"[SPLIT] excluded cases={sorted(list(excluded_set))} | removed={before-after} | remain={after}")
+
+    rng = random.Random(int(split_seed))
+    rng.shuffle(pool)
+
+    total = len(pool)
+    val_num = max(0, int(val_num))
+    test_num = max(0, int(test_num))
+    train_num = int(train_num)
+
+    if val_num + test_num > total:
+        overflow = val_num + test_num - total
+        test_num = max(0, test_num - overflow)
+
+    remain = total - (val_num + test_num)
+    if train_num < 0:
+        train_num = remain
+    else:
+        train_num = min(train_num, remain)
+
+    val_files = pool[:val_num]
+    test_files = pool[val_num: val_num + test_num]
+    train_files = pool[val_num + test_num: val_num + test_num + train_num]
+    return train_files, val_files, test_files
+
+
+def _strip_known_medical_suffix(path_text: str) -> str:
+    base = os.path.basename(str(path_text))
+    if base.endswith(".nii.gz"):
+        return base[:-7]
+    return os.path.splitext(base)[0]
+
+
+def _extract_case_number_from_text(text: str) -> str:
+    matches = _extract_case_ids_from_basename(os.path.basename(str(text)))
+    if matches:
+        return matches[0]
+    return ""
+
+
+def _extract_case_uid_from_text(text: str) -> str:
+    text = str(text).strip()
+    if not text:
+        return ""
+    case_number = _extract_case_number_from_text(text)
+    if case_number:
+        return case_number
+    stem = _strip_known_medical_suffix(text)
+    if stem:
+        return stem
+    return ""
+
+
+def _get_batch_meta_value(batch: Dict[str, Any], key: str) -> Any:
+    meta = batch.get("image_meta_dict", None)
+    if meta is None:
+        return None
+    if isinstance(meta, dict):
+        return meta.get(key)
+    return None
+
+
+def _first_meta_item(value: Any) -> Any:
+    if isinstance(value, (list, tuple)) and len(value) > 0:
+        return value[0]
+    return value
+
+
+def _get_case_info(
+    batch: Dict[str, Any],
+    fallback_case_id: str = "",
+    fallback_index: Optional[int] = None,
+) -> Tuple[str, str]:
+    candidates: List[str] = []
+    image_path = _first_meta_item(_get_batch_meta_value(batch, "filename_or_obj"))
+    if image_path:
+        candidates.append(str(image_path))
+    filename = _first_meta_item(_get_batch_meta_value(batch, "filename_or_obj"))
+    if filename:
+        candidates.append(str(filename))
+    for key in ("image", "label"):
+        value = batch.get(key, None)
+        if isinstance(value, str):
+            candidates.append(value)
+        elif isinstance(value, (list, tuple)) and value and isinstance(value[0], str):
+            candidates.append(value[0])
+    if fallback_case_id:
+        candidates.append(fallback_case_id)
+
+    for candidate in candidates:
+        candidate = str(candidate).strip()
+        if not candidate:
+            continue
+        case_uid = _extract_case_uid_from_text(candidate)
+        if case_uid:
+            return candidate, case_uid
+
+    if fallback_case_id:
+        fallback_case_id = str(fallback_case_id).strip()
+        fallback_uid = _extract_case_uid_from_text(fallback_case_id)
+        if fallback_uid:
+            return fallback_case_id, fallback_uid
+
+    if fallback_index is not None:
+        case_uid = f"case_{int(fallback_index):04d}"
+        return case_uid, case_uid
+
+    return "case_no_id", "case_no_id"
+
+
+def _get_spacing_for_batch(batch: Dict[str, Any], batch_size: int, default_spacing: Tuple[float, float, float]) -> List[Tuple[float, float, float]]:
+    spacing_value = _first_meta_item(_get_batch_meta_value(batch, "pixdim"))
+    if spacing_value is None:
+        spacing = tuple(float(x) for x in default_spacing)
+    else:
+        spacing_array = np.asarray(spacing_value, dtype=np.float32).reshape(-1)
+        if spacing_array.size >= 4:
+            spacing = tuple(float(x) for x in spacing_array[1:4])
+        elif spacing_array.size >= 3:
+            spacing = tuple(float(x) for x in spacing_array[:3])
+        else:
+            spacing = tuple(float(x) for x in default_spacing)
+    return [spacing for _ in range(batch_size)]
+
+
+def dice_per_class_onehot(
+    y_pred_1hot: torch.Tensor,
+    y_true_1hot: torch.Tensor,
+    eps: float = 1e-8,
+    ignore_empty: bool = True,
+) -> torch.Tensor:
+    if y_pred_1hot.dim() == 5:
+        y_pred_1hot = y_pred_1hot[0]
+    if y_true_1hot.dim() == 5:
+        y_true_1hot = y_true_1hot[0]
+
+    y_pred = y_pred_1hot.float()
+    y_true = y_true_1hot.float()
+
+    dims = tuple(range(1, y_pred.dim()))
+    inter = (y_pred * y_true).sum(dim=dims)
+    pred_sum = y_pred.sum(dim=dims)
+    true_sum = y_true.sum(dim=dims)
+    denom = pred_sum + true_sum
+
+    dice = (2.0 * inter) / (denom + eps)
+
+    if ignore_empty:
+        nan = torch.tensor(float("nan"), device=dice.device, dtype=dice.dtype)
+        dice = torch.where(true_sum > 0, dice, nan)
+    else:
+        dice = torch.where(denom > 0, dice, torch.ones_like(dice))
+    return dice
+
+
+def iou_per_class_onehot(
+    y_pred_1hot: torch.Tensor,
+    y_true_1hot: torch.Tensor,
+    eps: float = 1e-8,
+    ignore_empty: bool = True,
+) -> torch.Tensor:
+    if y_pred_1hot.dim() == 5:
+        y_pred_1hot = y_pred_1hot[0]
+    if y_true_1hot.dim() == 5:
+        y_true_1hot = y_true_1hot[0]
+
+    y_pred = y_pred_1hot.float()
+    y_true = y_true_1hot.float()
+
+    dims = tuple(range(1, y_pred.dim()))
+    inter = (y_pred * y_true).sum(dim=dims)
+    pred_sum = y_pred.sum(dim=dims)
+    true_sum = y_true.sum(dim=dims)
+    union = pred_sum + true_sum - inter
+
+    iou = inter / (union + eps)
+
+    if ignore_empty:
+        nan = torch.tensor(float("nan"), device=iou.device, dtype=iou.dtype)
+        iou = torch.where(true_sum > 0, iou, nan)
+    else:
+        iou = torch.where(union > 0, iou, torch.ones_like(iou))
+    return iou
+
+
+def hd95_per_class_onehot(
+    y_pred_1hot: torch.Tensor,
+    y_true_1hot: torch.Tensor,
+    spacing: Optional[Tuple[float, float, float]] = None,
+    include_background: bool = False,
+) -> torch.Tensor:
+    metric = HausdorffDistanceMetric(
+        include_background=include_background,
+        reduction="mean_batch",
+        percentile=95,
+        get_not_nans=True,
+    )
+    if spacing is None:
+        metric(y_pred=[y_pred_1hot], y=[y_true_1hot])
+    else:
+        metric(y_pred=[y_pred_1hot], y=[y_true_1hot], spacing=[tuple(float(x) for x in spacing)])
+    hd_agg = metric.aggregate()
+    metric.reset()
+    hd95 = hd_agg[0] if isinstance(hd_agg, (tuple, list)) else hd_agg
+    return hd95.detach().float().cpu()
+
+
+def write_dict_rows_to_csv(csv_path: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+@torch.no_grad()
+def run_evaluation_single_model(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    roi_size: Tuple[int, int, int],
+    sw_batch_size: int,
+    sw_overlap: float,
+    num_classes: int,
+    class_names: List[str],
+    post_label: AsDiscrete,
+    post_pred: AsDiscrete,
+    global_step: int,
+    writer: Optional[SummaryWriter] = None,
+    prefix: str = "val",
+    compute_hd95: bool = False,
+    default_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+) -> Dict[str, Any]:
+    model.eval()
+    dice_metric = DiceMetric(include_background=True, reduction="mean_batch", get_not_nans=True)
+    sum_iou = torch.zeros((num_classes,), dtype=torch.float64)
+    cnt_iou = torch.zeros((num_classes,), dtype=torch.float64)
+    sum_hd95 = torch.zeros((max(num_classes - 1, 0),), dtype=torch.float64)
+    cnt_hd95 = torch.zeros((max(num_classes - 1, 0),), dtype=torch.float64)
+
+    pbar = tqdm(loader, desc=f"{prefix.upper()}@{global_step}", dynamic_ncols=True)
+    for batch in pbar:
+        inputs = batch["image"].to(device)
+        labels = batch["label"].to(device)
+        outputs = sliding_window_inference(
+            inputs,
+            roi_size=roi_size,
+            sw_batch_size=sw_batch_size,
+            predictor=model,
+            overlap=sw_overlap,
+            mode="gaussian",
+        )
+        labels_list = decollate_batch(labels)
+        labels_convert = [post_label(x) for x in labels_list]
+        outputs_list = decollate_batch(outputs)
+        outputs_convert = [post_pred(x) for x in outputs_list]
+
+        dice_metric(y_pred=outputs_convert, y=labels_convert)
+
+        iou_c = iou_per_class_onehot(outputs_convert[0], labels_convert[0], ignore_empty=True)
+        iou_c_cpu = iou_c.detach().cpu().double()
+        iou_mask = ~torch.isnan(iou_c_cpu)
+        sum_iou += torch.nan_to_num(iou_c_cpu, nan=0.0)
+        cnt_iou += iou_mask.double()
+
+        if compute_hd95:
+            spacing = _get_spacing_for_batch(batch, len(outputs_convert), default_spacing)[0]
+            hd95_c = hd95_per_class_onehot(
+                outputs_convert[0],
+                labels_convert[0],
+                spacing=spacing,
+                include_background=False,
+            ).double()
+            hd95_mask = ~torch.isnan(hd95_c)
+            sum_hd95 += torch.nan_to_num(hd95_c, nan=0.0)
+            cnt_hd95 += hd95_mask.double()
+
+    dice_agg = dice_metric.aggregate()
+    dice_metric.reset()
+    dice_per_class = dice_agg[0] if isinstance(dice_agg, (tuple, list)) else dice_agg
+    dice_per_class = dice_per_class.detach().float().cpu()
+
+    iou_per_class = torch.full((num_classes,), float("nan"), dtype=torch.float64)
+    valid_iou = cnt_iou > 0
+    iou_per_class[valid_iou] = sum_iou[valid_iou] / cnt_iou[valid_iou]
+    iou_per_class = iou_per_class.float()
+
+    hd95_per_class = torch.full((max(num_classes - 1, 0),), float("nan"), dtype=torch.float64)
+    if compute_hd95 and hd95_per_class.numel() > 0:
+        valid_hd95 = cnt_hd95 > 0
+        hd95_per_class[valid_hd95] = sum_hd95[valid_hd95] / cnt_hd95[valid_hd95]
+    hd95_per_class = hd95_per_class.float()
+
+    dice_mean_incl_bg = float(torch.nanmean(dice_per_class).item())
+    dice_mean_fg = float(torch.nanmean(dice_per_class[1:]).item()) if num_classes > 1 else dice_mean_incl_bg
+    iou_mean_incl_bg = float(torch.nanmean(iou_per_class).item())
+    iou_mean_fg = float(torch.nanmean(iou_per_class[1:]).item()) if num_classes > 1 else iou_mean_incl_bg
+    hd95_mean_excl_bg = float(torch.nanmean(hd95_per_class).item()) if hd95_per_class.numel() > 0 else float("nan")
+
+    if writer is not None:
+        writer.add_scalar(f"{prefix}/dice_mean_fg", dice_mean_fg, global_step)
+        writer.add_scalar(f"{prefix}/dice_mean_incl_bg", dice_mean_incl_bg, global_step)
+        writer.add_scalar(f"{prefix}/iou_mean_fg", iou_mean_fg, global_step)
+        writer.add_scalar(f"{prefix}/iou_mean_incl_bg", iou_mean_incl_bg, global_step)
+        if compute_hd95:
+            writer.add_scalar(f"{prefix}/hd95_mean_excl_bg", hd95_mean_excl_bg, global_step)
+        for c in range(num_classes):
+            writer.add_scalar(f"{prefix}/per_class_dice/{class_names[c]}", float(dice_per_class[c].item()), global_step)
+            writer.add_scalar(f"{prefix}/per_class_iou/{class_names[c]}", float(iou_per_class[c].item()), global_step)
+        if compute_hd95:
+            for idx in range(hd95_per_class.numel()):
+                writer.add_scalar(f"{prefix}/per_class_hd95/{class_names[idx + 1]}", float(hd95_per_class[idx].item()), global_step)
+
+    return {
+        "dice_mean_incl_bg": dice_mean_incl_bg,
+        "dice_mean_fg": dice_mean_fg,
+        "iou_mean_incl_bg": iou_mean_incl_bg,
+        "iou_mean_fg": iou_mean_fg,
+        "hd95_mean_excl_bg": hd95_mean_excl_bg,
+        "dice_per_class_incl_bg": dice_per_class,
+        "iou_per_class_incl_bg": iou_per_class,
+        "hd95_per_class_excl_bg": hd95_per_class,
+    }
+
+
+
+@torch.no_grad()
+def run_test_ensemble_and_print_cases(
+    model: torch.nn.Module,
+    ckpt_paths: List[str],
+    loader: DataLoader,
+    device: torch.device,
+    roi_size: Tuple[int, int, int],
+    sw_batch_size: int,
+    sw_overlap: float,
+    num_classes: int,
+    class_names: List[str],
+    post_label: AsDiscrete,
+    post_pred: AsDiscrete,
+    global_step: int,
+    writer: Optional[SummaryWriter] = None,
+    prefix: str = "test",
+    compute_hd95: bool = True,
+    default_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+) -> Dict[str, Any]:
+    assert len(ckpt_paths) > 0, "ckpt_paths is empty"
+
+    sum_dice = torch.zeros((num_classes,), dtype=torch.float64)
+    cnt_dice = torch.zeros((num_classes,), dtype=torch.float64)
+    sum_iou = torch.zeros((num_classes,), dtype=torch.float64)
+    cnt_iou = torch.zeros((num_classes,), dtype=torch.float64)
+    sum_hd95 = torch.zeros((max(num_classes - 1, 0),), dtype=torch.float64)
+    cnt_hd95 = torch.zeros((max(num_classes - 1, 0),), dtype=torch.float64)
+
+    case_rows: List[Dict[str, Any]] = []
+    pbar = tqdm(loader, desc=f"{prefix.upper()}(ens{len(ckpt_paths)})@{global_step}", dynamic_ncols=True)
+
+    for batch_idx, batch in enumerate(pbar):
+        fallback_case_id = ""
+        if hasattr(loader, "dataset") and batch_idx < len(loader.dataset):
+            sample = loader.dataset.data[batch_idx]
+            fallback_case_id = str(sample.get("image", "") or sample.get("label", "") or "")
+
+        case_path, case_uid = _get_case_info(
+            batch,
+            fallback_case_id=fallback_case_id,
+            fallback_index=batch_idx,
+        )
+        case_index = batch_idx
+
+        inputs = batch["image"].to(device)
+        labels = batch["label"].to(device)
+
+        logits_sum = None
+        for p in ckpt_paths:
+            sd = torch.load(p, map_location=device)
+            if isinstance(sd, dict) and "model" in sd:
+                sd = sd["model"]
+            model.load_state_dict(sd, strict=True)
+            model.eval()
+            out = sliding_window_inference(
+                inputs,
+                roi_size=roi_size,
+                sw_batch_size=sw_batch_size,
+                predictor=model,
+                overlap=sw_overlap,
+                mode="gaussian",
+            )
+            logits_sum = out if logits_sum is None else (logits_sum + out)
+
+        logits = logits_sum / float(len(ckpt_paths))
+        labels_list = decollate_batch(labels)
+        labels_1hot_list = [post_label(x) for x in labels_list]
+        logits_list = decollate_batch(logits)
+        preds_1hot_list = [post_pred(x) for x in logits_list]
+
+        dice_c = dice_per_class_onehot(preds_1hot_list[0], labels_1hot_list[0], ignore_empty=True)
+        iou_c = iou_per_class_onehot(preds_1hot_list[0], labels_1hot_list[0], ignore_empty=True)
+
+        if compute_hd95:
+            spacing = _get_spacing_for_batch(batch, len(preds_1hot_list), default_spacing)[0]
+            hd95_c = hd95_per_class_onehot(
+                preds_1hot_list[0],
+                labels_1hot_list[0],
+                spacing=spacing,
+                include_background=False,
+            )
+        else:
+            hd95_c = torch.full((max(num_classes - 1, 0),), float("nan"), dtype=torch.float32)
+
+        dice_mean_incl_bg_case = float(torch.nanmean(dice_c).item())
+        dice_mean_fg_case = float(torch.nanmean(dice_c[1:]).item()) if num_classes > 1 else dice_mean_incl_bg_case
+        iou_mean_incl_bg_case = float(torch.nanmean(iou_c).item())
+        iou_mean_fg_case = float(torch.nanmean(iou_c[1:]).item()) if num_classes > 1 else iou_mean_incl_bg_case
+        hd95_mean_excl_bg_case = float(torch.nanmean(hd95_c).item()) if hd95_c.numel() > 0 else float("nan")
+
+        dice_c_cpu = dice_c.detach().cpu().double()
+        iou_c_cpu = iou_c.detach().cpu().double()
+        hd95_c_cpu = hd95_c.detach().cpu().double()
+
+        dice_mask = ~torch.isnan(dice_c_cpu)
+        iou_mask = ~torch.isnan(iou_c_cpu)
+        hd95_mask = ~torch.isnan(hd95_c_cpu)
+
+        sum_dice += torch.nan_to_num(dice_c_cpu, nan=0.0)
+        cnt_dice += dice_mask.double()
+        sum_iou += torch.nan_to_num(iou_c_cpu, nan=0.0)
+        cnt_iou += iou_mask.double()
+        if hd95_c_cpu.numel() > 0:
+            sum_hd95 += torch.nan_to_num(hd95_c_cpu, nan=0.0)
+            cnt_hd95 += hd95_mask.double()
+
+        case_rows.append(
+            {
+                "case_index": int(case_index),
+                "case_uid": case_uid,
+                "case_id": case_path,
+                "dice_mean_incl_bg": dice_mean_incl_bg_case,
+                "dice_mean_fg": dice_mean_fg_case,
+                "iou_mean_incl_bg": iou_mean_incl_bg_case,
+                "iou_mean_fg": iou_mean_fg_case,
+                "hd95_mean_excl_bg": hd95_mean_excl_bg_case,
+                "dice_per_class_incl_bg": tensor_to_float_list(dice_c.detach().cpu().float()),
+                "iou_per_class_incl_bg": tensor_to_float_list(iou_c.detach().cpu().float()),
+                "hd95_per_class_excl_bg": tensor_to_float_list(hd95_c.detach().cpu().float()),
+            }
+        )
+        pbar.set_postfix(
+            {
+                "case_fg_dice": f"{dice_mean_fg_case:.4f}",
+                "case_fg_iou": f"{iou_mean_fg_case:.4f}",
+            }
+        )
+
+    dice_per_class_mean = torch.full((num_classes,), float("nan"), dtype=torch.float64)
+    iou_per_class_mean = torch.full((num_classes,), float("nan"), dtype=torch.float64)
+    hd95_per_class = torch.full((max(num_classes - 1, 0),), float("nan"), dtype=torch.float64)
+
+    valid_dice = cnt_dice > 0
+    valid_iou = cnt_iou > 0
+    valid_hd95 = cnt_hd95 > 0
+
+    dice_per_class_mean[valid_dice] = sum_dice[valid_dice] / cnt_dice[valid_dice]
+    iou_per_class_mean[valid_iou] = sum_iou[valid_iou] / cnt_iou[valid_iou]
+    if hd95_per_class.numel() > 0:
+        hd95_per_class[valid_hd95] = sum_hd95[valid_hd95] / cnt_hd95[valid_hd95]
+
+    dice_per_class_mean_f32 = dice_per_class_mean.float()
+    iou_per_class_mean_f32 = iou_per_class_mean.float()
+    hd95_per_class_f32 = hd95_per_class.float()
+
+    dice_mean_incl_bg = float(torch.nanmean(dice_per_class_mean_f32).item())
+    dice_mean_fg = float(torch.nanmean(dice_per_class_mean_f32[1:]).item()) if num_classes > 1 else dice_mean_incl_bg
+    iou_mean_incl_bg = float(torch.nanmean(iou_per_class_mean_f32).item())
+    iou_mean_fg = float(torch.nanmean(iou_per_class_mean_f32[1:]).item()) if num_classes > 1 else iou_mean_incl_bg
+    hd95_mean_excl_bg = float(torch.nanmean(hd95_per_class_f32).item()) if hd95_per_class_f32.numel() > 0 else float("nan")
+
+    case_rows_sorted = sorted(case_rows, key=lambda r: r["dice_mean_fg"])
+    dices = np.array([r["dice_mean_fg"] for r in case_rows_sorted], dtype=np.float32)
+    mean_fg = float(np.mean(dices)) if dices.size > 0 else float("nan")
+    std_fg = float(np.std(dices)) if dices.size > 0 else float("nan")
+    thresh = mean_fg - 2.0 * std_fg if (not math.isnan(mean_fg) and not math.isnan(std_fg)) else float("-inf")
+
+    print("\n================ TEST CASES (sorted by fg Dice) ================")
+    print(f"Ensemble ckpts: {len(ckpt_paths)}")
+    print(f"Case fgDice mean={mean_fg:.6f} std={std_fg:.6f} | outlier<thr={thresh:.6f}\n")
+    for i, r in enumerate(case_rows_sorted):
+        flag = "  <-- OUTLIER" if (r["dice_mean_fg"] < thresh) else ""
+        print(
+            f"[{i:02d}] dataset_idx={r['case_index']:03d} | case_uid={r['case_uid']} | "
+            f"fgDice={r['dice_mean_fg']:.6f} | fgIoU={r['iou_mean_fg']:.6f} | "
+            f"fgHD95={r['hd95_mean_excl_bg']:.6f} | {r['case_id']}{flag}"
+        )
+    print("===============================================================\\n")
+
+    if writer is not None:
+        writer.add_scalar(f"{prefix}/dice_mean_fg", dice_mean_fg, global_step)
+        writer.add_scalar(f"{prefix}/dice_mean_incl_bg", dice_mean_incl_bg, global_step)
+        writer.add_scalar(f"{prefix}/iou_mean_fg", iou_mean_fg, global_step)
+        writer.add_scalar(f"{prefix}/iou_mean_incl_bg", iou_mean_incl_bg, global_step)
+        if compute_hd95:
+            writer.add_scalar(f"{prefix}/hd95_mean_excl_bg", hd95_mean_excl_bg, global_step)
+        for c in range(num_classes):
+            writer.add_scalar(
+                f"{prefix}/per_class_dice/{class_names[c]}",
+                float(dice_per_class_mean_f32[c].item()) if not torch.isnan(dice_per_class_mean_f32[c]) else float("nan"),
+                global_step,
+            )
+            writer.add_scalar(
+                f"{prefix}/per_class_iou/{class_names[c]}",
+                float(iou_per_class_mean_f32[c].item()) if not torch.isnan(iou_per_class_mean_f32[c]) else float("nan"),
+                global_step,
+            )
+        if compute_hd95:
+            for idx in range(hd95_per_class_f32.numel()):
+                writer.add_scalar(
+                    f"{prefix}/per_class_hd95/{class_names[idx + 1]}",
+                    float(hd95_per_class_f32[idx].item()),
+                    global_step,
+                )
+
+    return {
+        "dice_mean_incl_bg": dice_mean_incl_bg,
+        "dice_mean_fg": dice_mean_fg,
+        "iou_mean_incl_bg": iou_mean_incl_bg,
+        "iou_mean_fg": iou_mean_fg,
+        "hd95_mean_excl_bg": hd95_mean_excl_bg,
+        "dice_per_class_incl_bg": dice_per_class_mean_f32,
+        "iou_per_class_incl_bg": iou_per_class_mean_f32,
+        "hd95_per_class_excl_bg": hd95_per_class_f32,
+        "case_rows": case_rows_sorted,
+        "ensemble_ckpts": ckpt_paths,
+    }
+
+
+
+def main():
+    args = parse_args()
+
+                                  
+                
+                                  
+    run_id = args.run_name.strip() if args.run_name.strip() else datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(args.output_root, f"btcv_run_{run_id}")
+    os.makedirs(output_dir, exist_ok=True)
+    print("output_dir =", output_dir)
+
+                                  
+                        
+                                  
+    save_code_snapshot(output_dir=output_dir, extra_rel_paths=list(args.snapshot_extra))
+
+                                  
+                          
+                                  
+    print_config()
+    directory = os.environ.get("MONAI_DATA_DIRECTORY")
+    if directory is not None:
+        os.makedirs(directory, exist_ok=True)
+    root_dir = tempfile.mkdtemp() if directory is None else directory
+    print("MONAI root_dir =", root_dir)
+
+                                  
+            
+                                  
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device =", device)
+
+                                  
+           
+                                  
+    seed_everything(args.seed)
+    if args.cudnn_benchmark:
+        torch.backends.cudnn.benchmark = True
+        print("[WARN] cudnn_benchmark=True may reduce reproducibility even with fixed seeds.")
+
+                                  
+            
+                                  
+    json_path = os.path.join(args.data_dir, args.split_json)
+
+    pixdim = tuple(args.pixdim)
+    roi_size = tuple(args.roi_size)
+    num_classes = int(args.num_classes)
+    class_names = get_class_names(num_classes)
+
+                                  
+                     
+                                                                         
+                                                
+                                  
+    with open(json_path, "r", encoding="utf-8") as f:
+        json_meta = json.load(f)
+
+    def _has_labeled_pairs(key: str) -> bool:
+        part = json_meta.get(key, [])
+        return bool(part) and all(isinstance(d, dict) and d.get("image") and d.get("label") for d in part)
+
+    if (not args.disable_json_split) and _has_labeled_pairs("training") and _has_labeled_pairs("validation") and _has_labeled_pairs("test"):
+        train_files = load_decathlon_datalist(json_path, True, "training")
+        val_files = load_decathlon_datalist(json_path, True, "validation")
+        test_files = load_decathlon_datalist(json_path, True, "test")
+
+        excluded_set = {_normalize_case_id(x) for x in args.exclude_cases} if args.exclude_cases else set()
+        if excluded_set:
+            train_files = [d for d in train_files if not _match_excluded_case(d, excluded_set)]
+            val_files = [d for d in val_files if not _match_excluded_case(d, excluded_set)]
+            test_files = [d for d in test_files if not _match_excluded_case(d, excluded_set)]
+            print(f"[SPLIT] excluded cases={sorted(list(excluded_set))} | predefined json split filtered")
+        val_source = "json_predefined"
+    elif args.val_separate:
+        train_files, val_files, test_files = build_custom_splits_from_json(
+            json_path=json_path,
+            pool_keys=args.pool_keys,
+            train_num=args.train_num,
+            val_num=args.val_num,
+            test_num=args.test_num,
+            split_seed=args.split_seed,
+            exclude_cases=args.exclude_cases,
+        )
+        val_source = "separate_val"
+    else:
+        train_files, _empty_val, test_files = build_custom_splits_from_json(
+            json_path=json_path,
+            pool_keys=args.pool_keys,
+            train_num=args.train_num,
+            val_num=0,            
+            test_num=args.test_num,
+            split_seed=args.split_seed,
+            exclude_cases=args.exclude_cases,
+        )
+        val_files = list(test_files)
+        val_source = "test_as_val"
+
+    print("\n================ SPLIT ================")
+    print(f"[POOL] keys={args.pool_keys} | split_seed={args.split_seed}")
+    print(f"[EXCL] exclude_cases={args.exclude_cases if args.exclude_cases else '[] (no exclusion)'}")
+    print(f"[VAL ] val_source={val_source} | val_start_iter={args.val_start_iter}")
+    print(f"[SPLIT] train={len(train_files)} | val={len(val_files)} | test={len(test_files)}")
+    print("=======================================\n")
+    val_files = _fix_split_pair_paths(val_files, split_name="val")
+    test_files = _fix_split_pair_paths(test_files, split_name="test")
+                       
+    cfg = vars(args).copy()
+    cfg.update(
+        {
+            "output_dir": output_dir,
+            "json_path": json_path,
+            "pixdim": pixdim,
+            "roi_size": roi_size,
+            "device": str(device),
+            "class_names": class_names,
+            "class_labels": CLASS_LABELS,
+            "best_selection_metric": "val/dice_mean_fg (foreground only)",
+            "early_stop_metric": "val/dice_mean_fg (foreground only)",
+            "test_report_metrics": [
+                "test/dice_mean_fg (foreground only)",
+                "test/iou_mean_fg (foreground only)",
+                "test/hd95_mean_excl_bg (foreground only, spacing-aware)",
+            ],
+            "sw_infer_mode": "gaussian",
+            "exclude_cases": list(args.exclude_cases),
+            "code_snapshot_dir": os.path.join(output_dir, "snapshot"),
+            "val_source": val_source,
+            "val_start_iter": int(args.val_start_iter),
+            "save_ckpt_every": int(args.save_ckpt_every),
+            "effective_split_sizes": {
+                "train": int(len(train_files)),
+                "val": int(len(val_files)),
+                "test": int(len(test_files)),
+            },
+        }
+    )
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        json.dump(cfg, f, indent=2)
+
+                                  
+                 
+                                  
+    writer = SummaryWriter(log_dir=os.path.join(output_dir, "tb"))
+    writer.add_text("meta/output_dir", output_dir, 0)
+    writer.add_text("meta/json_path", json_path, 0)
+    writer.add_text("meta/sw_infer_mode", "gaussian", 0)
+    writer.add_text("meta/sw_overlap", str(args.sw_overlap), 0)
+    writer.add_text("meta/save_ckpt_every", str(args.save_ckpt_every), 0)
+    writer.add_text("meta/exclude_cases", ",".join(list(args.exclude_cases)) if args.exclude_cases else "", 0)
+    writer.add_text("meta/code_snapshot_dir", os.path.join(output_dir, "snapshot"), 0)
+    writer.add_text("meta/val_source", val_source, 0)
+    writer.add_text("meta/val_start_iter", str(args.val_start_iter), 0)
+    writer.add_text("meta/optimizer", str(args.optimizer).lower(), 0)
+    writer.add_text("meta/adamw_betas", str(tuple(float(x) for x in args.adamw_betas)), 0)
+    writer.add_text("meta/adamw_eps", str(float(args.adamw_eps)), 0)
+
+                                  
+                
+                                  
+    train_transforms = Compose(
+        [
+            LoadImaged(keys=["image", "label"]),
+            EnsureChannelFirstd(keys=["image", "label"]),
+            Orientationd(
+                keys=["image", "label"],
+                axcodes="RAS",
+                labels=(("L", "R"), ("P", "A"), ("I", "S")),
+            ),
+            Spacingd(keys=["image", "label"], pixdim=pixdim, mode=("bilinear", "nearest")),
+            ScaleIntensityRanged(
+                keys=["image"],
+                a_min=-125,
+                a_max=275,
+                b_min=0.0,
+                b_max=1.0,
+                clip=True,
+            ),
+            CropForegroundd(keys=["image", "label"], source_key="image", allow_smaller=True),
+            RandCropByPosNegLabeld(
+                keys=["image", "label"],
+                label_key="label",
+                spatial_size=roi_size,
+                pos=1,
+                neg=1,
+                num_samples=args.num_samples,
+                image_key="image",
+                image_threshold=0,
+            ),
+            RandShiftIntensityd(
+                keys=["image"],
+                offsets=0.10,
+                prob=0.50,
+            ),
+            RandAffined(
+                keys=['image', 'label'],
+                mode=('bilinear', 'nearest'),
+                prob=1.0, spatial_size=(96, 96, 96),
+                rotate_range=(0, 0, np.pi / 30),
+                scale_range=(0.1, 0.1, 0.1)),
+            RandGaussianNoised(keys=["image"], std=0.01, prob=0.15),
+        ]
+    )
+
+    eval_transforms = Compose(
+        [
+            LoadImaged(keys=["image", "label"]),
+            EnsureChannelFirstd(keys=["image", "label"]),
+            Orientationd(
+                keys=["image", "label"],
+                axcodes="RAS",
+                labels=(("L", "R"), ("P", "A"), ("I", "S")),
+            ),
+            Spacingd(keys=["image", "label"], pixdim=pixdim, mode=("bilinear", "nearest")),
+            ScaleIntensityRanged(
+                keys=["image"],
+                a_min=-125,
+                a_max=275,
+                b_min=0.0,
+                b_max=1.0,
+                clip=True,
+            ),
+            CropForegroundd(keys=["image", "label"], source_key="image", allow_smaller=True),
+        ]
+    )
+
+                                  
+                
+                                  
+    train_list_path = os.path.join(output_dir, "train_files_list.json")
+    val_list_path = os.path.join(output_dir, "val_files_list.json")
+    test_list_path = os.path.join(output_dir, "test_files_list.json")
+    with open(train_list_path, "w") as f:
+        json.dump(train_files, f, indent=2)
+    with open(val_list_path, "w") as f:
+        json.dump(val_files, f, indent=2)
+    with open(test_list_path, "w") as f:
+        json.dump(test_files, f, indent=2)
+
+                                  
+                                
+                                  
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
+                                  
+                                              
+                                  
+    cache_num_train = len(train_files) if args.cache_num_train <= 0 else min(args.cache_num_train, len(train_files))
+    train_ds = CacheDataset(
+        data=train_files,
+        transform=train_transforms,
+        cache_num=cache_num_train,
+        cache_rate=args.cache_rate,
+        num_workers=args.num_workers_train,
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers_train,
+        pin_memory=True,
+        collate_fn=list_data_collate,
+        persistent_workers=(args.num_workers_train > 0),
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+
+                                  
+                                                 
+                                  
+    val_ds = None
+    val_loader = None
+    test_ds = None
+    test_loader = None
+
+    cache_num_val = len(val_files) if args.cache_num_val <= 0 else min(args.cache_num_val, len(val_files))
+    cache_num_test = len(test_files) if args.cache_num_test <= 0 else min(args.cache_num_test, len(test_files))
+
+    def ensure_val_loader() -> DataLoader:
+        nonlocal val_ds, val_loader
+        if val_loader is not None:
+            return val_loader
+                                          
+        val_ds = CacheDataset(
+            data=val_files,
+            transform=eval_transforms,
+            cache_num=cache_num_val,
+            cache_rate=args.cache_rate,
+            num_workers=args.num_workers_val,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=1,
+            shuffle=False,
+            num_workers=args.num_workers_val,
+            pin_memory=True,
+            persistent_workers=(args.num_workers_val > 0),
+            worker_init_fn=seed_worker,
+            generator=g,
+        )
+        print(f"[VAL] loader built (lazy) | size={len(val_files)} | cache_num={cache_num_val}")
+        return val_loader
+
+    def ensure_test_loader() -> DataLoader:
+        nonlocal test_ds, test_loader, val_ds, val_loader
+        if test_loader is not None:
+            return test_loader
+
+                                                                                
+        if (
+            (val_source == "test_as_val")
+            and (val_loader is not None)
+            and (args.num_workers_test == args.num_workers_val)
+            and (cache_num_test == cache_num_val)
+        ):
+            test_loader = val_loader
+            test_ds = val_ds
+            print("[TEST] reuse val_loader as test_loader (val=test)")
+            return test_loader
+
+                                            
+        test_ds = CacheDataset(
+            data=test_files,
+            transform=eval_transforms,
+            cache_num=cache_num_test,
+            cache_rate=args.cache_rate,
+            num_workers=args.num_workers_test,
+        )
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=1,
+            shuffle=False,
+            num_workers=args.num_workers_test,
+            pin_memory=True,
+            persistent_workers=(args.num_workers_test > 0),
+            worker_init_fn=seed_worker,
+            generator=g,
+        )
+        print(f"[TEST] loader built (lazy) | size={len(test_files)} | cache_num={cache_num_test}")
+        return test_loader
+
+    model = WFT_UNet(in_chans=1,out_chans=16).to(device)
+
+    loss_function = DiceCELoss(to_onehot_y=True, softmax=True)
+
+    def build_param_groups(m: torch.nn.Module, weight_decay: float):
+        decay, no_decay = [], []
+        for n, p in m.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.dim() == 1 or n.endswith(".bias") or ("norm" in n.lower()) or ("bn" in n.lower()):
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        return [
+            {"params": decay, "weight_decay": float(weight_decay)},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+
+    def build_optimizer(args: argparse.Namespace, m: torch.nn.Module) -> torch.optim.Optimizer:
+        param_groups = build_param_groups(m, weight_decay=float(args.wd))
+        optimizer_name = str(args.optimizer).lower()
+
+        if optimizer_name == "sgd":
+            optimizer = torch.optim.SGD(
+                param_groups,
+                lr=float(args.lr),
+                momentum=float(args.momentum),
+            )
+        elif optimizer_name == "adamw":
+            optimizer = torch.optim.AdamW(
+                param_groups,
+                lr=float(args.lr),
+                betas=(float(args.adamw_betas[0]), float(args.adamw_betas[1])),
+                eps=float(args.adamw_eps),
+            )
+        else:
+            raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+
+        return optimizer
+
+    optimizer = build_optimizer(args, model)
+    print(
+        f"[OPTIM] optimizer={str(args.optimizer).lower()} | lr={float(args.lr):.6g} | "
+        f"wd={float(args.wd):.6g} | momentum={float(args.momentum):.6g} | "
+        f"adamw_betas={tuple(float(x) for x in args.adamw_betas)} | adamw_eps={float(args.adamw_eps):.6g}"
+    )
+
+                                        
+    scheduler = None
+    if args.use_poly:
+        base_lr = float(args.lr)
+
+        def lr_lambda(step: int):
+                                                    
+            t = min(max(step, 0), int(args.max_iterations))
+            poly = (1.0 - t / float(args.max_iterations)) ** float(args.poly_power)
+                             
+            return max(float(args.min_lr) / base_lr, poly)
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+    post_label = AsDiscrete(to_onehot=num_classes)
+    post_pred = AsDiscrete(argmax=True, to_onehot=num_classes)
+
+    use_amp = bool(args.amp and device.type == "cuda")
+    scaler = GradScaler(enabled=use_amp)
+    periodic_ckpt_dir = os.path.join(output_dir, "periodic_checkpoints")
+    os.makedirs(periodic_ckpt_dir, exist_ok=True)
+    best_path = os.path.join(output_dir, "best.pt")
+    last_resume_path = os.path.join(output_dir, "last_resume.pt")
+    global_step = 0
+    best_val_dice_fg = -1.0
+    best_step = -1
+    eval_history: List[Dict[str, Any]] = []
+    num_evals = 0
+    bad_evals = 0
+    stop_training = False
+    early_stop_reason = ""
+
+    def _build_full_training_checkpoint(step: int) -> Dict[str, Any]:
+        ckpt = {
+            "iter": int(step),
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "scaler": scaler.state_dict() if scaler is not None else None,
+            "best_val_dice_fg": float(best_val_dice_fg),
+            "best_step": int(best_step),
+            "eval_history": eval_history,
+            "num_evals": int(num_evals),
+            "bad_evals": int(bad_evals),
+            "early_stop_reason": str(early_stop_reason),
+            "args": vars(args),
+            "rng_state": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch_cpu": torch.get_rng_state(),
+                "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                "loader_generator": g.get_state(),
+            },
+        }
+        return ckpt
+
+    def save_periodic_checkpoint(step: int) -> None:
+        ckpt_path = os.path.join(periodic_ckpt_dir, f"iter{step:06d}.pt")
+        torch.save(_build_full_training_checkpoint(step), ckpt_path)
+        print(f"[SAVE] periodic full checkpoint @ iter={step} -> {ckpt_path}")
+        torch.save(_build_full_training_checkpoint(step), last_resume_path)
+        print(f"[SAVE] last resume checkpoint updated -> {last_resume_path}")
+
+    def try_resume_from_checkpoint(resume_path: str) -> None:
+        nonlocal global_step, best_val_dice_fg, best_step
+        nonlocal eval_history, num_evals, bad_evals, early_stop_reason
+        if not resume_path:
+            return
+        if not os.path.isfile(resume_path):
+            raise FileNotFoundError(f"--resume file not found: {resume_path}")
+        print(f"[RESUME] loading full checkpoint from: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        if "model" not in ckpt:
+            raise ValueError(
+                "The resume checkpoint does not contain key 'model'. "
+                "It looks like a model-only checkpoint, not a full training checkpoint."
+            )
+        model.load_state_dict(ckpt["model"], strict=True)
+        if "optimizer" in ckpt and ckpt["optimizer"] is not None:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if scheduler is not None and ckpt.get("scheduler") is not None:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        if scaler is not None and ckpt.get("scaler") is not None:
+            scaler.load_state_dict(ckpt["scaler"])
+        global_step = int(ckpt.get("iter", 0))
+        best_val_dice_fg = float(ckpt.get("best_val_dice_fg", -1.0))
+        best_step = int(ckpt.get("best_step", -1))
+        eval_history = list(ckpt.get("eval_history", []))
+        num_evals = int(ckpt.get("num_evals", 0))
+        bad_evals = int(ckpt.get("bad_evals", 0))
+        early_stop_reason = str(ckpt.get("early_stop_reason", ""))
+        rng_state = ckpt.get("rng_state", {})
+        try:
+            if "python" in rng_state and rng_state["python"] is not None:
+                random.setstate(rng_state["python"])
+            if "numpy" in rng_state and rng_state["numpy"] is not None:
+                np.random.set_state(rng_state["numpy"])
+            if "torch_cpu" in rng_state and rng_state["torch_cpu"] is not None:
+                torch.set_rng_state(rng_state["torch_cpu"])
+            if torch.cuda.is_available() and ("torch_cuda" in rng_state) and (rng_state["torch_cuda"] is not None):
+                torch.cuda.set_rng_state_all(rng_state["torch_cuda"])
+            if "loader_generator" in rng_state and rng_state["loader_generator"] is not None:
+                g.set_state(rng_state["loader_generator"])
+        except Exception as e:
+            print(f"[RESUME][WARN] failed to fully restore RNG state: {type(e).__name__}: {e}")
+        print(
+            f"[RESUME] success | iter={global_step} | "
+            f"best_val_dice_fg={best_val_dice_fg:.6f} | best_step={best_step} | "
+            f"num_evals={num_evals} | bad_evals={bad_evals}"
+        )
+
+    if args.resume.strip():
+        try_resume_from_checkpoint(args.resume.strip())
+
+    pbar = tqdm(
+    total=args.max_iterations,
+    initial=global_step,
+    desc="Training",
+    dynamic_ncols=True,
+    )
+    t0 = time.time()
+
+    while (global_step < args.max_iterations) and (not stop_training):
+        model.train()
+        for batch in train_loader:
+            if global_step >= args.max_iterations or stop_training:
+                break
+
+            x = batch["image"].to(device)
+            y = batch["label"].to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with autocast(device_type=device.type, enabled=use_amp):
+                                        
+                logits = model(x)
+                loss = loss_function(logits, y)
+
+                                                        
+            writer.add_scalar("train/loss_total", float(loss.item()), global_step)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            if scheduler is not None:
+                scheduler.step()
+
+            global_step += 1
+            pbar.update(1)
+
+            lr_now = optimizer.param_groups[0]["lr"]
+            writer.add_scalar("train/loss", float(loss.item()), global_step)
+            writer.add_scalar("train/lr", float(lr_now), global_step)
+            pbar.set_description(f"Training iter={global_step}/{args.max_iterations} loss={loss.item():.5f}")
+
+            if args.save_ckpt_every > 0 and (global_step % args.save_ckpt_every == 0):
+                save_periodic_checkpoint(global_step)
+
+            do_eval_now = ((global_step % args.eval_num == 0) or (global_step == args.max_iterations))
+            if do_eval_now and (global_step >= int(args.val_start_iter)):
+                prev_best = float(best_val_dice_fg)
+                vloader = ensure_val_loader()
+                val_res = run_evaluation_single_model(
+                    model=model,
+                    loader=vloader,
+                    device=device,
+                    roi_size=roi_size,
+                    sw_batch_size=args.sw_batch_size,
+                    sw_overlap=args.sw_overlap,
+                    num_classes=num_classes,
+                    class_names=class_names,
+                    post_label=post_label,
+                    post_pred=post_pred,
+                    global_step=global_step,
+                    writer=writer,
+                    prefix="val",
+                    compute_hd95=False,
+                    default_spacing=pixdim,
+                )
+                model.train()
+                dice_fg = float(val_res["dice_mean_fg"])
+                dice_incl_bg = float(val_res["dice_mean_incl_bg"])
+                iou_fg = float(val_res["iou_mean_fg"])
+                eval_history.append(
+                    {
+                        "iter": int(global_step),
+                        "train_loss_at_eval": float(loss.item()),
+                        "val_dice_mean_fg": safe_float(dice_fg),
+                        "val_dice_mean_incl_bg": safe_float(dice_incl_bg),
+                        "val_iou_mean_fg": safe_float(iou_fg),
+                        "val_iou_per_class_incl_bg": tensor_to_float_list(val_res["iou_per_class_incl_bg"]),
+                        "val_source": val_source,
+                        "val_dice_per_class_incl_bg": tensor_to_float_list(val_res["dice_per_class_incl_bg"]),
+                    }
+                )
+                if dice_fg > best_val_dice_fg:
+                    best_val_dice_fg = float(dice_fg)
+                    best_step = int(global_step)
+                    torch.save(model.state_dict(), best_path)
+                    print(f"[SAVE] best.pt @ iter={best_step} | best_val_dice_fg={best_val_dice_fg:.4f} | val_dice_incl_bg={dice_incl_bg:.4f} | val_iou_fg={iou_fg:.4f}")
+                else:
+                    print(f"[NOSAVE] best_val_dice_fg={best_val_dice_fg:.4f} | current_val_dice_fg={dice_fg:.4f} | val_dice_incl_bg={dice_incl_bg:.4f} | val_iou_fg={iou_fg:.4f}")
+                num_evals += 1
+                improved_for_early_stop = dice_fg > (prev_best + args.early_stop_min_delta)
+                if improved_for_early_stop:
+                    bad_evals = 0
+                elif num_evals > args.early_stop_warmup:
+                    bad_evals += 1
+                writer.add_scalar("train/early_stop_bad_evals", bad_evals, global_step)
+                writer.add_scalar("train/best_val_dice_mean_fg", float(best_val_dice_fg), global_step)
+                if (num_evals > args.early_stop_warmup) and (bad_evals >= args.early_stop_patience):
+                    stop_training = True
+                    early_stop_reason = (
+                        f"no improvement in val foreground Dice for {bad_evals} validations "
+                        f"(patience={args.early_stop_patience}, min_delta={args.early_stop_min_delta})"
+                    )
+                    print(f"[EARLY STOP] iter={global_step} | {early_stop_reason}")
+                    writer.add_text("meta/early_stop_reason", early_stop_reason, global_step)
+                    break
+
+    pbar.close()
+    dt = time.time() - t0
+    print(f"Training finished. Time: {dt/60:.1f} min")
+    writer.add_scalar("meta/train_minutes", dt / 60.0, global_step)
+
+    if stop_training:
+        print(f"Stopped early at iter={global_step}. Reason: {early_stop_reason}")
+        torch.save(_build_full_training_checkpoint(global_step), last_resume_path)
+        print(f"[SAVE] final last resume checkpoint -> {last_resume_path}")
+    ckpt_paths = [best_path] if os.path.isfile(best_path) else []
+    if len(ckpt_paths) > 0:
+        tloader = ensure_test_loader()
+        test_res = run_test_ensemble_and_print_cases(
+            model=model,
+            ckpt_paths=ckpt_paths,
+            loader=tloader,
+            device=device,
+            roi_size=roi_size,
+            sw_batch_size=args.sw_batch_size,
+            sw_overlap=args.sw_overlap,
+            num_classes=num_classes,
+            class_names=class_names,
+            post_label=post_label,
+            post_pred=post_pred,
+            global_step=best_step if best_step > 0 else global_step,
+            writer=writer,
+            prefix="test",
+            compute_hd95=True,
+            default_spacing=pixdim,
+        )
+        test_dice_fg = float(test_res["dice_mean_fg"])
+        test_iou_fg = float(test_res["iou_mean_fg"])
+        test_hd95 = float(test_res["hd95_mean_excl_bg"])
+        dice_pc = test_res["dice_per_class_incl_bg"]
+        iou_pc = test_res["iou_per_class_incl_bg"]
+        hd_pc = test_res["hd95_per_class_excl_bg"]
+        print("\n================ TEST ================")
+        print(f"best_iter                 : {best_step}")
+        print(f"best_val_dice_fg          : {best_val_dice_fg:.6f}")
+        print(f"TEST dice_mean_fg         : {test_dice_fg:.6f}")
+        print(f"TEST iou_mean_fg          : {test_iou_fg:.6f}")
+        print(f"TEST hd95_mean_excl_bg    : {test_hd95:.6f}")
+        print("======================================\n")
+        print("Per-class Dice and IoU (incl bg, mean-over-cases):")
+        for c in range(num_classes):
+            dice_v = float(dice_pc[c].item()) if not torch.isnan(dice_pc[c]) else float("nan")
+            iou_v = float(iou_pc[c].item()) if not torch.isnan(iou_pc[c]) else float("nan")
+            print(f"  [{c:02d}] {class_names[c]:>18s} : Dice={dice_v:.6f} | IoU={iou_v:.6f}")
+        print("\nPer-class HD95 (excl bg):")
+        for c in range(1, num_classes):
+            idx = c - 1
+            if idx < hd_pc.numel():
+                v = float(hd_pc[idx].item())
+                print(f"  [{c:02d}] {class_names[c]:>18s} : {v:.6f}")
+        summary_csv = os.path.join(output_dir, "test_metrics_summary.csv")
+        per_organ_csv = os.path.join(output_dir, "test_metrics_per_organ.csv")
+        per_case_csv = os.path.join(output_dir, "test_metrics_per_case.csv")
+
+        write_dict_rows_to_csv(
+            summary_csv,
+            [{
+                "best_path": best_path if os.path.isfile(best_path) else "",
+                "best_iter": int(best_step),
+                "best_val_dice_mean_fg": safe_float(best_val_dice_fg),
+                "test_dice_mean_incl_bg": safe_float(test_res["dice_mean_incl_bg"]),
+                "test_dice_mean_fg": safe_float(test_dice_fg),
+                "test_iou_mean_incl_bg": safe_float(test_res["iou_mean_incl_bg"]),
+                "test_iou_mean_fg": safe_float(test_iou_fg),
+                "test_hd95_mean_excl_bg": safe_float(test_hd95),
+                "early_stopped": bool(stop_training),
+                "early_stop_reason": early_stop_reason,
+                "val_source": val_source,
+                "test_size": int(len(test_files)),
+            }],
+            [
+                "best_path",
+                "best_iter",
+                "best_val_dice_mean_fg",
+                "test_dice_mean_incl_bg",
+                "test_dice_mean_fg",
+                "test_iou_mean_incl_bg",
+                "test_iou_mean_fg",
+                "test_hd95_mean_excl_bg",
+                "early_stopped",
+                "early_stop_reason",
+                "val_source",
+                "test_size",
+            ],
+        )
+
+        per_organ_rows = []
+        for c in range(1, num_classes):
+            row = {
+                "class_index": c,
+                "class_name": class_names[c],
+                "dice": safe_float(float(dice_pc[c].item())) if not torch.isnan(dice_pc[c]) else None,
+                "iou": safe_float(float(iou_pc[c].item())) if not torch.isnan(iou_pc[c]) else None,
+                "hd95": None,
+            }
+            if (c - 1) < hd_pc.numel() and not torch.isnan(hd_pc[c - 1]):
+                row["hd95"] = safe_float(float(hd_pc[c - 1].item()))
+            per_organ_rows.append(row)
+        write_dict_rows_to_csv(per_organ_csv, per_organ_rows, ["class_index", "class_name", "dice", "iou", "hd95"])
+
+        per_case_rows = []
+        organ_names = class_names[1:]
+        for row in test_res["case_rows"]:
+            out_row = {
+                "case_index": row["case_index"],
+                "case_uid": row["case_uid"],
+                "case_id": row["case_id"],
+                "dice_mean_incl_bg": safe_float(row["dice_mean_incl_bg"]),
+                "dice_mean_fg": safe_float(row["dice_mean_fg"]),
+                "iou_mean_incl_bg": safe_float(row["iou_mean_incl_bg"]),
+                "iou_mean_fg": safe_float(row["iou_mean_fg"]),
+                "hd95_mean_excl_bg": safe_float(row["hd95_mean_excl_bg"]),
+            }
+            for c, class_name in enumerate(class_names):
+                out_row[f"dice_{class_name}"] = row["dice_per_class_incl_bg"][c]
+                out_row[f"iou_{class_name}"] = row["iou_per_class_incl_bg"][c]
+            for organ_idx, organ_name in enumerate(organ_names):
+                out_row[f"hd95_{organ_name}"] = row["hd95_per_class_excl_bg"][organ_idx]
+            per_case_rows.append(out_row)
+
+        per_case_fields = (
+            [
+                "case_index",
+                "case_uid",
+                "case_id",
+                "dice_mean_incl_bg",
+                "dice_mean_fg",
+                "iou_mean_incl_bg",
+                "iou_mean_fg",
+                "hd95_mean_excl_bg",
+            ]
+            + [f"dice_{name}" for name in class_names]
+            + [f"iou_{name}" for name in class_names]
+            + [f"hd95_{name}" for name in organ_names]
+        )
+        write_dict_rows_to_csv(per_case_csv, per_case_rows, per_case_fields)
+    else:
+        print(f"[WARN] No checkpoints found for testing. best_path={best_path}")
+
+    writer.close()
+    print("\nSaved artifacts:")
+    print(" -", os.path.join(output_dir, "config.json"))
+    print(" -", os.path.join(output_dir, "tb"))
+    print(" -", os.path.join(output_dir, "snapshot"))
+    print(" -", best_path)
+    print(" -", periodic_ckpt_dir)
+    print(" -", os.path.join(output_dir, "test_metrics_summary.csv"))
+    print(" -", os.path.join(output_dir, "test_metrics_per_organ.csv"))
+    print(" -", os.path.join(output_dir, "test_metrics_per_case.csv"))
+    print(" -", os.path.join(output_dir, "train_files_list.json"))
+    print(" -", os.path.join(output_dir, "val_files_list.json"))
+    print(" -", os.path.join(output_dir, "test_files_list.json"))
+
+
+if __name__ == "__main__":
+    main()  
