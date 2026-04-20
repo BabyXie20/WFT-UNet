@@ -1,3 +1,14 @@
+"""
+WFT-UNet model implementation.
+
+This file follows the terminology used in the manuscript:
+- CWEM: Cross-band Wavelet Enhancement Module
+- FDFM: Frequency Dynamic Filtering Module
+- CAFM: Cross-Attentive Fusion Module
+- SFFB-I: Spatial-Frequency Fusion Block-I, used in the first encoder stage
+- SFFB-II: Spatial-Frequency Fusion Block-II, used in deeper encoder stages
+"""
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -11,14 +22,17 @@ _KEYS = ["LLL", "LLH", "LHL", "LHH", "HLL", "HLH", "HHL", "HHH"]
 
 
 def tuple_to_bands(t):
+    """Convert DWT output tuple into a named wavelet-subband dictionary."""
     return {k: v for k, v in zip(_KEYS, t)}
 
 
 def bands_to_tuple(bands: dict):
+    """Convert named wavelet-subband dictionary back to the IDWT input tuple."""
     return tuple(bands[k] for k in _KEYS)
 
 
 def _valid_num_groups(num_channels: int, max_groups: int = 8) -> int:
+    """Return the largest valid GroupNorm group number for the channel count."""
     max_groups = min(max_groups, num_channels)
     for g in range(max_groups, 0, -1):
         if num_channels % g == 0:
@@ -27,6 +41,7 @@ def _valid_num_groups(num_channels: int, max_groups: int = 8) -> int:
 
 
 class ConvBlock(nn.Module):
+    """Basic 3D convolutional block used for local spatial feature extraction."""
     def __init__(self, n_stages, n_filters_in, n_filters_out):
         super().__init__()
         ops = []
@@ -43,6 +58,7 @@ class ConvBlock(nn.Module):
 
 
 class ResidualConvBlock(nn.Module):
+    """Residual 3D convolutional block for optional residual spatial modeling."""
     def __init__(self, n_stages, n_filters_in, n_filters_out):
         super().__init__()
 
@@ -71,6 +87,7 @@ class ResidualConvBlock(nn.Module):
 
 
 class DownsamplingConvBlock(nn.Module):
+    """Strided 3D convolution for encoder downsampling."""
     def __init__(self, n_filters_in, n_filters_out, stride=2):
         super().__init__()
         self.conv = nn.Sequential(
@@ -84,6 +101,7 @@ class DownsamplingConvBlock(nn.Module):
 
 
 class UpsamplingDeconvBlock(nn.Module):
+    """Transposed 3D convolution for decoder upsampling."""
     def __init__(self, n_filters_in, n_filters_out, stride=2):
         super().__init__()
         self.conv = nn.Sequential(
@@ -97,6 +115,12 @@ class UpsamplingDeconvBlock(nn.Module):
 
 
 class CrossWindowAttention(nn.Module):
+    """Window-based cross-attention.
+
+    The query tokens are taken from one feature branch and the key/value tokens
+    from another branch. In CWEM, this implements local low-high wavelet
+    interaction within aligned 3D windows.
+    """
     def __init__(self, dim, num_heads, window_size=(7, 7, 7), qkv_bias=True, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         self.dim = dim
@@ -168,6 +192,11 @@ class CrossWindowAttention(nn.Module):
 
 
 class CrossShiftWindowAttn3D(nn.Module):
+    """Shifted 3D window cross-attention wrapper used by CWEM.
+
+    It partitions 3D feature maps into local windows, applies cross-attention,
+    reverses the window partition, and adds a residual connection.
+    """
     def __init__(self, dim, num_heads, window_size=(7, 7, 7), shift=True, qkv_bias=True, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         self.window_size = window_size
@@ -219,7 +248,14 @@ class CrossShiftWindowAttn3D(nn.Module):
         return x_q + out  
     
 
-class BandGraphFusion(nn.Module):
+class CrossBandDependencyGating(nn.Module):
+    """Cross-band Dependency Gating (CDG) used inside CWEM.
+
+    The seven high-frequency wavelet subbands are treated as graph nodes.
+    Statistical descriptors are used to build a sparse top-k similarity graph,
+    and masked attention generates channel gates for adaptive high-frequency
+    subband recalibration.
+    """
     def __init__(self,channels: int,num_heads: int = 4,topk: int = 3,attn_drop: float = 0.0,proj_drop: float = 0.0,eps: float = 1e-6):
         super().__init__()
         self.channels = channels
@@ -324,11 +360,17 @@ class BandGraphFusion(nn.Module):
         return F_fused
     
 
-class WaveletCrossBandBlock(nn.Module):
+class CrossBandWaveletEnhancementBlock(nn.Module):
+    """One CWEM interaction block.
+
+    This block first fuses the seven high-frequency wavelet subbands using CDG,
+    then performs sequential low-to-high and high-to-low interaction through
+    window cross-attention.
+    """
     def __init__(self, channels: int, num_heads: int, window_size=(7, 7, 7), shift=True):
         super().__init__()
 
-        self.fusion = BandGraphFusion(
+        self.fusion = CrossBandDependencyGating(
             channels=channels,
             num_heads=num_heads,   
             topk=3,         
@@ -375,14 +417,20 @@ class WaveletCrossBandBlock(nn.Module):
         return out
 
 
-class WaveletDWT_Cross_IDWT(nn.Module):
+class CrossBandWaveletEnhancementModule(nn.Module):
+    """Cross-band Wavelet Enhancement Module (CWEM).
+
+    CWEM decomposes the input feature into 3D wavelet subbands, enhances
+    cross-band dependencies and low-high interactions, and reconstructs the
+    enhanced feature with inverse DWT.
+    """
     def __init__(self,wavename: str,channels: int,num_heads: int,window_size=(6, 6, 6),shift=True,n_blocks: int = 1):
         super().__init__()
         self.dwt = DWT_3D(wavename)
         self.idwt = IDWT_3D(wavename)
 
         self.blocks = nn.ModuleList([
-            WaveletCrossBandBlock(
+            CrossBandWaveletEnhancementBlock(
                 channels=channels,
                 num_heads=num_heads,
                 window_size=window_size,
@@ -391,6 +439,7 @@ class WaveletDWT_Cross_IDWT(nn.Module):
             for i in range(n_blocks)
         ])
     def forward(self, x):
+        # 3D DWT produces one low-frequency subband and seven high-frequency subbands.
         bands_tuple = self.dwt(x)
         bands = tuple_to_bands(bands_tuple)     
 
@@ -398,12 +447,18 @@ class WaveletDWT_Cross_IDWT(nn.Module):
             bands = blk(bands)
 
         LLL, LLH, LHL, LHH, HLL, HLH, HHL, HHH = bands_to_tuple(bands)
+        # Reconstruct the enhanced feature map using inverse 3D DWT.
         y = self.idwt(LLL, LLH, LHL, LHH, HLL, HLH, HHL, HHH)
 
         return y
 
 
-class MagnitudeOnlyNorm3D(nn.Module):
+class MagnitudeGuidedNormalization3D(nn.Module):
+    """Magnitude-guided normalization for complex Fourier features.
+
+    Real and imaginary parts are modulated by a gain computed from the spectral
+    magnitude, preserving their relative phase-related structure.
+    """
     def __init__(self, channels: int, max_gn_groups: int = 8, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -420,10 +475,15 @@ class MagnitudeOnlyNorm3D(nn.Module):
         return torch.cat([xr * gain, xi * gain], dim=1)
 
 
-class FreqConditionalPE3D(nn.Module):
+class FourierDomainModulation(nn.Module):
+    """Fourier-domain modulation stage in FDFM.
+
+    This module applies magnitude-guided normalization and depthwise spectral
+    convolution to stabilize and encode complex Fourier features.
+    """
     def __init__(self, channels: int, max_gn_groups: int = 8):
         super().__init__()
-        self.norm = MagnitudeOnlyNorm3D(channels, max_gn_groups)
+        self.norm = MagnitudeGuidedNormalization3D(channels, max_gn_groups)
         self.dw_conv = nn.Conv3d(
             channels,
             channels,
@@ -437,13 +497,19 @@ class FreqConditionalPE3D(nn.Module):
         return x + self.dw_conv(self.norm(x))
 
 
-class FreqDynamicConv3D(nn.Module):
+class BandDynamicSpectralConvolution(nn.Module):
+    """Band Dynamic Spectral Convolution (BDSC) used inside FDFM.
+
+    The Fourier spectrum is partitioned into low-, middle-, and high-frequency
+    radial bands. Band-level statistics are used to dynamically mix expert
+    filters for adaptive spectral modulation.
+    """
     def __init__(self,channels: int,num_experts: int = 4,kernel_size: int = 3,max_gn_groups: int = 8):
         super().__init__()
         self.channels = channels
         self.num_experts = num_experts
         self.complex_channels = channels // 2
-        self.norm = MagnitudeOnlyNorm3D(channels, max_gn_groups)
+        self.norm = MagnitudeGuidedNormalization3D(channels, max_gn_groups)
 
         pad = kernel_size // 2
         self.experts = nn.ModuleList([
@@ -516,18 +582,24 @@ class FreqDynamicConv3D(nn.Module):
         return y
 
 
-class FrequencyBranch(nn.Module):
+class FrequencyDynamicFilteringModule(nn.Module):
+    """Frequency Dynamic Filtering Module (FDFM).
+
+    FDFM transforms features into the Fourier domain, performs magnitude-guided
+    spectral encoding and band-wise dynamic filtering, and reconstructs the
+    filtered response back to the spatial domain with a residual connection.
+    """
     def __init__(self, channels: int, num_experts: int = 4, max_gn_groups: int = 8):
         super().__init__()
         self.channels = channels
         self.freq_channels = channels * 2
 
-        self.freq_pe = FreqConditionalPE3D(
+        self.freq_pe = FourierDomainModulation(
             channels=self.freq_channels,
             max_gn_groups=max_gn_groups,
         )
 
-        self.freq_dyn = FreqDynamicConv3D(
+        self.freq_dyn = BandDynamicSpectralConvolution(
             channels=self.freq_channels,
             num_experts=num_experts,
             kernel_size=3,
@@ -540,6 +612,7 @@ class FrequencyBranch(nn.Module):
 
         fft_in = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
 
+        # Transform the spatial feature into the non-redundant 3D Fourier spectrum.
         x_fft = torch.fft.rfftn(fft_in, dim=(-3, -2, -1), norm="ortho")
 
         xr = x_fft.real
@@ -552,6 +625,7 @@ class FrequencyBranch(nn.Module):
         yr, yi = torch.chunk(x_freq, 2, dim=1)
         y_fft = torch.complex(yr.contiguous(), yi.contiguous())
 
+        # Transform the filtered complex spectrum back to the spatial domain.
         y = torch.fft.irfftn(y_fft, s=(d, h, w), dim=(-3, -2, -1), norm="ortho")
 
         y = y.to(x_in.dtype)
@@ -559,7 +633,12 @@ class FrequencyBranch(nn.Module):
         return y
 
 
-class CAFM(nn.Module):
+class CrossAttentiveFusionModule(nn.Module):
+    """Cross-Attentive Fusion Module (CAFM).
+
+    CAFM models cross-channel correspondence between the spatial and frequency
+    branches and applies spatial attention to produce a fused representation.
+    """
     def __init__(self, channels):
         super().__init__()
         self.channels = channels
@@ -603,38 +682,55 @@ class CAFM(nn.Module):
         return self.fusion(torch.cat([f1_enh, f2_enh], dim=1))
     
 
-class DualDomainBlockv1(nn.Module):
+class SpatialFrequencyFusionBlockI(nn.Module):
+    """Spatial-Frequency Fusion Block-I (SFFB-I).
+
+    Used in the first encoder stage. It contains a spatial branch and CWEM.
+    FDFM is omitted at this high-resolution stage to avoid costly spectral
+    processing on dense feature maps.
+    """
     def __init__(self,n:int,channels: int,num_heads: int):
         super().__init__()
-        self.fre = WaveletDWT_Cross_IDWT(wavename="bior2.2",channels=channels,num_heads=num_heads)
-        self.spa =  ConvBlock(n_stages=n,n_filters_in=channels,n_filters_out=channels)
-        self.fuse = CAFM(channels=channels)
+        self.cwem = CrossBandWaveletEnhancementModule(wavename="bior2.2",channels=channels,num_heads=num_heads)
+        self.spatial_branch = ConvBlock(n_stages=n,n_filters_in=channels,n_filters_out=channels)
+        self.cafm = CrossAttentiveFusionModule(channels=channels)
 
     def forward(self, x):
-        x_spa=self.spa(x)
-        x_fre=self.fre(x)
-        y=self.fuse(x_spa,x_fre)
+        x_spatial = self.spatial_branch(x)
+        x_frequency = self.cwem(x)
+        y = self.cafm(x_spatial, x_frequency)
 
         return y
     
 
-class DualDomainBlockV2(nn.Module):
+class SpatialFrequencyFusionBlockII(nn.Module):
+    """Spatial-Frequency Fusion Block-II (SFFB-II).
+
+    Used in deeper encoder stages. It combines a spatial branch, CWEM, FDFM,
+    and CAFM to jointly model local spatial details, wavelet-domain boundary
+    cues, and Fourier-domain global spectral structure.
+    """
     def __init__(self, n: int, channels: int,num_heads:int,n_blocks:int):
         super().__init__()
-        self.fre1 = WaveletDWT_Cross_IDWT(wavename="bior2.2",channels=channels,num_heads=num_heads,n_blocks=n_blocks)
-        self.fre2 = FrequencyBranch(channels=channels)
-        self.spa = ConvBlock(n_stages=n,n_filters_in=channels,n_filters_out=channels)
-        self.fuse = CAFM(channels=channels)
+        self.cwem = CrossBandWaveletEnhancementModule(wavename="bior2.2",channels=channels,num_heads=num_heads,n_blocks=n_blocks)
+        self.fdfm = FrequencyDynamicFilteringModule(channels=channels)
+        self.spatial_branch = ConvBlock(n_stages=n,n_filters_in=channels,n_filters_out=channels)
+        self.cafm = CrossAttentiveFusionModule(channels=channels)
 
     def forward(self, x):
-        x_spa = self.spa(x)
-        x_fre1 = self.fre1(x)
-        x_fre2 =self.fre2(x_fre1)
-        y = self.fuse(x_spa, x_fre2)
+        x_spatial = self.spatial_branch(x)
+        x_wavelet = self.cwem(x)
+        x_frequency = self.fdfm(x_wavelet)
+        y = self.cafm(x_spatial, x_frequency)
         return y
     
 
 class Encoder(nn.Module):
+    """Encoder of WFT-UNet.
+
+    The first stage uses SFFB-I, while deeper stages use SFFB-II. The final
+    bottleneck is implemented with a convolutional block.
+    """
     def __init__(self, n_channels=1, n_filters=16, has_residual=False):
         super().__init__()
         conv = ResidualConvBlock if has_residual else ConvBlock
@@ -644,16 +740,16 @@ class Encoder(nn.Module):
 
         self.stem = conv(stages[0], n_channels, chs[0])
 
-        self.blk0 = DualDomainBlockv1(n=stages[0], channels=chs[0], num_heads=2)
+        self.blk0 = SpatialFrequencyFusionBlockI(n=stages[0], channels=chs[0], num_heads=2)
 
         self.down0 = DownsamplingConvBlock(chs[0], chs[1])
-        self.blk1 = DualDomainBlockV2(n=stages[1], channels=chs[1], num_heads=4,n_blocks=2)
+        self.blk1 = SpatialFrequencyFusionBlockII(n=stages[1], channels=chs[1], num_heads=4,n_blocks=2)
 
         self.down1 = DownsamplingConvBlock(chs[1], chs[2])
-        self.blk2 = DualDomainBlockV2(n=stages[2], channels=chs[2], num_heads=8,n_blocks=1)
+        self.blk2 = SpatialFrequencyFusionBlockII(n=stages[2], channels=chs[2], num_heads=8,n_blocks=1)
 
         self.down2 = DownsamplingConvBlock(chs[2], chs[3])
-        self.blk3 = DualDomainBlockV2(n=stages[3], channels=chs[3], num_heads=8,n_blocks=1)
+        self.blk3 = SpatialFrequencyFusionBlockII(n=stages[3], channels=chs[3], num_heads=8,n_blocks=1)
 
         self.down3 = DownsamplingConvBlock(chs[3], chs[4])
         self.blk4 = conv(stages[4], chs[4], chs[4])
@@ -672,6 +768,7 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
+    """Decoder of WFT-UNet with skip connections for volumetric segmentation."""
     def __init__(self, n_classes=14, n_filters=16, has_residual=False):
         super().__init__()
         conv = ResidualConvBlock if has_residual else ConvBlock
@@ -707,7 +804,8 @@ class Decoder(nn.Module):
         return self.out_conv(x)
     
 
-class WFT_UNet(nn.Module):
+class WFTUNet(nn.Module):
+    """WFT-UNet for 3D abdominal CT multi-organ segmentation."""
     def __init__(self, n_channels=1, n_classes=14, n_filters=16, has_residual=False):
         super().__init__()
         self.encoder = Encoder(n_channels=n_channels, n_filters=n_filters, has_residual=has_residual)
