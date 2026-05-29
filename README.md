@@ -4,13 +4,6 @@ Official implementation of **WFT-UNet: A Wavelet-Fourier Transform UNet for 3D A
 
 This repository provides the PyTorch implementation of WFT-UNet, a lightweight spatial-frequency fusion network for 3D abdominal CT multi-organ segmentation. WFT-UNet integrates spatial-domain feature learning, wavelet-domain structural detail enhancement, Fourier-domain dynamic filtering, and cross-attentive spatial-frequency fusion.
 
-## Manuscript
-
-This repository is directly associated with the manuscript submitted to *The Visual Computer*:
-
-**WFT-UNet: A Wavelet-Fourier Transform UNet for 3D Abdominal Multi-organ Segmentation**
-
-If you use this code, model, or experimental setting in your research, please cite the associated manuscript.
 
 ## Permanent Archive
 
